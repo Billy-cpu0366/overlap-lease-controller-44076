@@ -2,7 +2,6 @@ package cron
 
 import (
 	"context"
-	"sort"
 	"sync"
 	"time"
 )
@@ -11,7 +10,8 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries   []*Entry
+	// planner is the sole owner of schedule arithmetic and the entry set.
+	planner   *schedulePlanner
 	chain     Chain
 	stop      chan struct{}
 	add       chan *Entry
@@ -23,7 +23,10 @@ type Cron struct {
 	location  *time.Location
 	parser    ScheduleParser
 	nextID    EntryID
-	jobWaiter sync.WaitGroup
+	// recorder is the sole owner of launching and tracking in-flight jobs.
+	recorder *jobRecorder
+	// trigger is the sole owner of waiting for the next activation.
+	trigger *trigger
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -74,45 +77,25 @@ type Entry struct {
 // Valid returns true if this is not the zero entry.
 func (e Entry) Valid() bool { return e.ID != 0 }
 
-// byTime is a wrapper for sorting the entry array by time
-// (with zero time at the end).
-type byTime []*Entry
-
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
-	}
-	if s[j].Next.IsZero() {
-		return true
-	}
-	return s[i].Next.Before(s[j].Next)
-}
-
 // New returns a new Cron job runner, modified by the given options.
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
-		entries:   nil,
 		chain:     NewChain(),
 		add:       make(chan *Entry),
 		stop:      make(chan struct{}),
@@ -123,10 +106,13 @@ func New(opts ...Option) *Cron {
 		logger:    DefaultLogger,
 		location:  time.Local,
 		parser:    standardParser,
+		recorder:  newJobRecorder(),
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.planner = newSchedulePlanner(c.location)
+	c.trigger = newTrigger()
 	return c
 }
 
@@ -146,6 +132,8 @@ func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
 func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
+	// Parse is the only entry point for turning a spec string into a Schedule;
+	// a given spec yields exactly one Schedule, with errors reported as before.
 	schedule, err := c.parser.Parse(spec)
 	if err != nil {
 		return 0, err
@@ -166,7 +154,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Job:        cmd,
 	}
 	if !c.running {
-		c.entries = append(c.entries, entry)
+		c.planner.append(entry)
 	} else {
 		c.add <- entry
 	}
@@ -182,7 +170,7 @@ func (c *Cron) Entries() []Entry {
 		c.snapshot <- replyChan
 		return <-replyChan
 	}
-	return c.entrySnapshot()
+	return c.planner.snapshot()
 }
 
 // Location gets the time zone location
@@ -207,7 +195,7 @@ func (c *Cron) Remove(id EntryID) {
 	if c.running {
 		c.remove <- id
 	} else {
-		c.removeEntry(id)
+		c.planner.remove(id)
 	}
 }
 
@@ -234,83 +222,74 @@ func (c *Cron) Run() {
 	c.run()
 }
 
-// run the scheduler.. this is private just due to the need to synchronize
-// access to the 'running' state variable.
+// run is the single drive line. Every mutation of the entry set, every
+// ordering and due-time decision, and every computation of a following
+// activation happens here: additions, removals, snapshots, wake-ups and stop
+// are all serviced from this one loop. The planner owns the schedule math,
+// the trigger owns waiting, and the recorder owns launching the jobs.
 func (c *Cron) run() {
 	c.logger.Info("start")
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
-	for _, entry := range c.entries {
-		entry.Next = entry.Schedule.Next(now)
+	c.planner.prime(now, func(entry *Entry) {
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
-	}
+	})
 
 	for {
-		// Determine the next entry to run.
-		sort.Sort(byTime(c.entries))
+		// Determine the next entry to run. Ordering is the planner's call.
+		c.planner.sort()
 
-		var timer *time.Timer
-		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
-			// If there are no entries yet, just sleep - it still handles new entries
-			// and stop requests.
-			timer = time.NewTimer(100000 * time.Hour)
+		// The trigger only waits; the duration is derived from the planner.
+		var wait time.Duration
+		if c.planner.len() == 0 || c.planner.earliest().IsZero() {
+			// If there are no entries yet, just sleep - it still handles new
+			// entries and stop requests.
+			wait = idleWait
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			wait = c.planner.earliest().Sub(now)
 		}
+		c.trigger.arm(wait)
 
 		for {
 			select {
-			case now = <-timer.C:
+			case now = <-c.trigger.wake():
 				now = now.In(c.location)
 				c.logger.Info("wake", "now", now)
 
-				// Run every entry whose next time was less than now
-				for _, e := range c.entries {
-					if e.Next.After(now) || e.Next.IsZero() {
-						break
-					}
-					c.startJob(e.WrappedJob)
-					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
+				// Run every entry whose next time was less than now. Which
+				// entries those are is decided solely by the planner.
+				for _, e := range c.planner.due(now) {
+					c.recorder.launch(e.WrappedJob)
+					c.planner.advance(e, now)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
 			case newEntry := <-c.add:
-				timer.Stop()
+				c.trigger.stop()
 				now = c.now()
-				newEntry.Next = newEntry.Schedule.Next(now)
-				c.entries = append(c.entries, newEntry)
+				c.planner.add(newEntry, now)
 				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
 
 			case replyChan := <-c.snapshot:
-				replyChan <- c.entrySnapshot()
+				replyChan <- c.planner.snapshot()
 				continue
 
 			case <-c.stop:
-				timer.Stop()
+				c.trigger.stop()
 				c.logger.Info("stop")
 				return
 
 			case id := <-c.remove:
-				timer.Stop()
+				c.trigger.stop()
 				now = c.now()
-				c.removeEntry(id)
+				c.planner.remove(id)
 				c.logger.Info("removed", "entry", id)
 			}
 
 			break
 		}
 	}
-}
-
-// startJob runs the given job in a new goroutine.
-func (c *Cron) startJob(j Job) {
-	c.jobWaiter.Add(1)
-	go func() {
-		defer c.jobWaiter.Done()
-		j.Run()
-	}()
 }
 
 // now returns current time in c location
@@ -329,27 +308,8 @@ func (c *Cron) Stop() context.Context {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		c.jobWaiter.Wait()
+		c.recorder.wait()
 		cancel()
 	}()
 	return ctx
-}
-
-// entrySnapshot returns a copy of the current cron entry list.
-func (c *Cron) entrySnapshot() []Entry {
-	var entries = make([]Entry, len(c.entries))
-	for i, e := range c.entries {
-		entries[i] = *e
-	}
-	return entries
-}
-
-func (c *Cron) removeEntry(id EntryID) {
-	var entries []*Entry
-	for _, e := range c.entries {
-		if e.ID != id {
-			entries = append(entries, e)
-		}
-	}
-	c.entries = entries
 }
