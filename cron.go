@@ -2,7 +2,6 @@ package cron
 
 import (
 	"context"
-	"sort"
 	"sync"
 	"time"
 )
@@ -10,8 +9,19 @@ import (
 // Cron keeps track of any number of entries, invoking the associated func as
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
+//
+// Cron itself is only the unified front line: it owns the single run loop
+// through which every add, remove, snapshot and stop flows, and delegates
+// the actual work to its components --
+//   - the parser turns spec strings into Schedules (see parser.go),
+//   - the entry store plans, orders and advances activation times and
+//     records entry state (see entry.go),
+//   - the executor runs due jobs and tracks them for shutdown (see
+//     executor.go),
+//   - the logger records what the loop decided (see logger.go).
 type Cron struct {
-	entries   []*Entry
+	store     *entryStore
+	executor  jobExecutor
 	chain     Chain
 	stop      chan struct{}
 	add       chan *Entry
@@ -23,7 +33,6 @@ type Cron struct {
 	location  *time.Location
 	parser    ScheduleParser
 	nextID    EntryID
-	jobWaiter sync.WaitGroup
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -43,76 +52,25 @@ type Schedule interface {
 	Next(time.Time) time.Time
 }
 
-// EntryID identifies an entry within a Cron instance
-type EntryID int
-
-// Entry consists of a schedule and the func to execute on that schedule.
-type Entry struct {
-	// ID is the cron-assigned ID of this entry, which may be used to look up a
-	// snapshot or remove it.
-	ID EntryID
-
-	// Schedule on which this job should be run.
-	Schedule Schedule
-
-	// Next time the job will run, or the zero time if Cron has not been
-	// started or this entry's schedule is unsatisfiable
-	Next time.Time
-
-	// Prev is the last time this job was run, or the zero time if never.
-	Prev time.Time
-
-	// WrappedJob is the thing to run when the Schedule is activated.
-	WrappedJob Job
-
-	// Job is the thing that was submitted to cron.
-	// It is kept around so that user code that needs to get at the job later,
-	// e.g. via Entries() can do so.
-	Job Job
-}
-
-// Valid returns true if this is not the zero entry.
-func (e Entry) Valid() bool { return e.ID != 0 }
-
-// byTime is a wrapper for sorting the entry array by time
-// (with zero time at the end).
-type byTime []*Entry
-
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
-	}
-	if s[j].Next.IsZero() {
-		return true
-	}
-	return s[i].Next.Before(s[j].Next)
-}
-
 // New returns a new Cron job runner, modified by the given options.
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
-		entries:   nil,
 		chain:     NewChain(),
 		add:       make(chan *Entry),
 		stop:      make(chan struct{}),
@@ -127,6 +85,7 @@ func New(opts ...Option) *Cron {
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.store = newEntryStore(c.logger)
 	return c
 }
 
@@ -166,7 +125,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Job:        cmd,
 	}
 	if !c.running {
-		c.entries = append(c.entries, entry)
+		c.store.appendRaw(entry)
 	} else {
 		c.add <- entry
 	}
@@ -182,7 +141,7 @@ func (c *Cron) Entries() []Entry {
 		c.snapshot <- replyChan
 		return <-replyChan
 	}
-	return c.entrySnapshot()
+	return c.store.snapshot()
 }
 
 // Location gets the time zone location
@@ -207,7 +166,7 @@ func (c *Cron) Remove(id EntryID) {
 	if c.running {
 		c.remove <- id
 	} else {
-		c.removeEntry(id)
+		c.store.remove(id)
 	}
 }
 
@@ -234,29 +193,29 @@ func (c *Cron) Run() {
 	c.run()
 }
 
-// run the scheduler.. this is private just due to the need to synchronize
-// access to the 'running' state variable.
+// run is the single main line of the scheduler: it asks the entry store to
+// plan and order activation times, sleeps until the earliest one is due,
+// hands due entries to the executor, and services add, remove, snapshot and
+// stop requests. No other goroutine sorts entries, decides due-ness or
+// advances schedules.
 func (c *Cron) run() {
 	c.logger.Info("start")
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
-	for _, entry := range c.entries {
-		entry.Next = entry.Schedule.Next(now)
-		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
-	}
+	c.store.plan(now)
 
 	for {
 		// Determine the next entry to run.
-		sort.Sort(byTime(c.entries))
+		c.store.sortByTime()
 
 		var timer *time.Timer
-		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
+		if earliest := c.store.earliest(); earliest.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
 			timer = time.NewTimer(100000 * time.Hour)
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			timer = time.NewTimer(earliest.Sub(now))
 		}
 
 		for {
@@ -266,25 +225,18 @@ func (c *Cron) run() {
 				c.logger.Info("wake", "now", now)
 
 				// Run every entry whose next time was less than now
-				for _, e := range c.entries {
-					if e.Next.After(now) || e.Next.IsZero() {
-						break
-					}
-					c.startJob(e.WrappedJob)
-					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
-					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
+				for _, e := range c.store.due(now) {
+					c.executor.start(e.WrappedJob)
+					c.store.advance(e, now)
 				}
 
 			case newEntry := <-c.add:
 				timer.Stop()
 				now = c.now()
-				newEntry.Next = newEntry.Schedule.Next(now)
-				c.entries = append(c.entries, newEntry)
-				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
+				c.store.insert(newEntry, now)
 
 			case replyChan := <-c.snapshot:
-				replyChan <- c.entrySnapshot()
+				replyChan <- c.store.snapshot()
 				continue
 
 			case <-c.stop:
@@ -295,22 +247,13 @@ func (c *Cron) run() {
 			case id := <-c.remove:
 				timer.Stop()
 				now = c.now()
-				c.removeEntry(id)
+				c.store.remove(id)
 				c.logger.Info("removed", "entry", id)
 			}
 
 			break
 		}
 	}
-}
-
-// startJob runs the given job in a new goroutine.
-func (c *Cron) startJob(j Job) {
-	c.jobWaiter.Add(1)
-	go func() {
-		defer c.jobWaiter.Done()
-		j.Run()
-	}()
 }
 
 // now returns current time in c location
@@ -329,27 +272,8 @@ func (c *Cron) Stop() context.Context {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		c.jobWaiter.Wait()
+		c.executor.wait()
 		cancel()
 	}()
 	return ctx
-}
-
-// entrySnapshot returns a copy of the current cron entry list.
-func (c *Cron) entrySnapshot() []Entry {
-	var entries = make([]Entry, len(c.entries))
-	for i, e := range c.entries {
-		entries[i] = *e
-	}
-	return entries
-}
-
-func (c *Cron) removeEntry(id EntryID) {
-	var entries []*Entry
-	for _, e := range c.entries {
-		if e.ID != id {
-			entries = append(entries, e)
-		}
-	}
-	c.entries = entries
 }
